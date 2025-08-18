@@ -5,13 +5,106 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import math
-from typing import List, Set, Tuple
+from typing import List, Set, Tuple, Dict
 from collections import defaultdict
 
 # Amino acid alphabet in the order ProteinMPNN uses
 ALPHABET = ['A', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'K', 'L', 'M', 'N', 'P', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'X']
 # Standard amino acids (excluding 'X')
 STANDARD_ALPHABET = ALPHABET[:20]
+AA_3_TO_1 = {
+    'ALA': 'A', 'CYS': 'C', 'ASP': 'D', 'GLU': 'E', 'PHE': 'F', 'GLY': 'G', 'HIS': 'H',
+    'ILE': 'I', 'LYS': 'K', 'LEU': 'L', 'MET': 'M', 'ASN': 'N', 'PRO': 'P', 'GLN': 'Q',
+    'ARG': 'R', 'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
+}
+
+# --- [NEW] HELPER FUNCTIONS for PDB parsing and fixing residues ---
+
+def get_pdb_info(pdb_path: str, chains_to_parse: List[str]) -> Tuple[str, Dict[str, int]]:
+    """
+    Parses a PDB file to get the native sequence and a map of residue IDs to indices.
+    
+    Args:
+        pdb_path: Path to the PDB file.
+        chains_to_parse: A list of chain IDs to include. If empty, all chains are used.
+
+    Returns:
+        A tuple containing:
+        - native_sequence (str): The amino acid sequence from the PDB.
+        - res_id_to_index (dict): A map from "A12" -> 0, "A13" -> 1, etc.
+    """
+    native_sequence = []
+    res_id_to_index = {}
+    
+    seen_residues = set()
+    current_index = -1
+
+    with open(pdb_path, 'r') as f:
+        for line in f:
+            if line.startswith("ATOM"):
+                chain = line[21:22].strip()
+                if not chains_to_parse or chain in chains_to_parse:
+                    res_seq_str = line[22:26].strip()
+                    if not res_seq_str: continue # Skip if residue number is empty
+                    res_seq = int(res_seq_str)
+                    res_name = line[17:20].strip()
+                    atom_name = line[12:16].strip()
+                    icode = line[26:27].strip()
+
+                    if atom_name == "CA": # Use C-alpha atoms to define sequence
+                        res_id_full = (chain, res_seq, icode)
+                        if res_id_full not in seen_residues:
+                            seen_residues.add(res_id_full)
+                            current_index += 1
+                            
+                            if res_name in AA_3_TO_1:
+                                native_sequence.append(AA_3_TO_1[res_name])
+                                res_id_simple = f"{chain}{res_seq}{icode.strip()}"
+                                res_id_to_index[res_id_simple] = current_index
+                            else:
+                                print(f"Warning: Skipping unrecognized residue '{res_name}' at {res_id_full}")
+
+    return "".join(native_sequence), res_id_to_index
+
+
+def apply_fixed_residues(
+    sequences: Set[str], 
+    native_sequence: str, 
+    fixed_indices: Set[int]
+) -> Set[str]:
+    """
+    Enforces fixed residues on a set of generated sequences.
+
+    Args:
+        sequences: A set of sequences to process.
+        native_sequence: The original sequence from the PDB.
+        fixed_indices: A set of 0-based indices that should be fixed.
+
+    Returns:
+        A new set of sequences with the native amino acids at the fixed positions.
+    """
+    if not fixed_indices:
+        return sequences
+
+    print(f"Applying fixed residues at {len(fixed_indices)} positions...")
+    corrected_sequences = set()
+    native_list = list(native_sequence)
+
+    for seq in sequences:
+        seq_list = list(seq)
+        if len(seq_list) != len(native_list):
+            print(f"Warning: Length mismatch between generated ({len(seq_list)}) and native ({len(native_list)}) sequences. Cannot apply fixed residues.")
+            corrected_sequences.add(seq)
+            continue
+            
+        for idx in fixed_indices:
+            if idx < len(seq_list):
+                seq_list[idx] = native_list[idx]
+        
+        corrected_sequences.add("".join(seq_list))
+        
+    return corrected_sequences
+
 
 # --- Core Helper Functions ---
 
@@ -81,19 +174,6 @@ def calculate_sequence_score(sequence: str, logits_list: List[torch.Tensor], wei
 def weighted_average(logits_list: List[torch.Tensor], weights: List[float], num_sequences: int, temperature: float) -> Set[str]:
     """
     Generates sequences from a weighted average of logits.
-
-    This method combines the logits from multiple conformational states into a single
-    set of logits by taking a weighted average. It's a simple way to bias the
-    sequence generation towards states with higher weights.
-
-    Args:
-        logits_list: A list of logits tensors, one for each state.
-        weights: A list of floats representing the weight for each state.
-        num_sequences: The number of sequences to generate.
-        temperature: The sampling temperature.
-
-    Returns:
-        A set of unique generated sequences.
     """
     print(f"--- Running Weighted Average (T={temperature}) ---")
     if len(logits_list) != len(weights):
@@ -111,20 +191,6 @@ def weighted_average(logits_list: List[torch.Tensor], weights: List[float], num_
 def winner_take_all(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences: int, temperature: float) -> Set[str]:
     """
     For each position, chooses logits from the state with the higher max logit value.
-
-    This is a hard-switching method. For each residue position, it compares the
-    highest logit value in state A vs. state B. It then uses the *entire* set of
-    21 logits from whichever state "won" that position. This can be useful for
-    creating sequences that are mosaics of the most confident predictions from each state.
-
-    Args:
-        logits_A: Logits tensor for the first state.
-        logits_B: Logits tensor for the second state.
-        num_sequences: The number of sequences to generate.
-        temperature: The sampling temperature.
-
-    Returns:
-        A set of unique generated sequences.
     """
     print(f"--- Running Winner-Take-All (T={temperature}) ---")
     wta_logits = get_wta_logits(logits_A, logits_B)
@@ -143,23 +209,6 @@ def get_wta_logits(logits_A: torch.Tensor, logits_B: torch.Tensor) -> torch.Tens
 def gibbs_sampling(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences: int, iterations: int, start_temp: float, end_temp: float, use_wta_init: bool) -> Set[str]:
     """
     Iteratively refines sequences using Gibbs sampling with temperature annealing.
-
-    This is a stochastic search method. It starts with a sequence (either random or
-    from WTA) and iteratively tries to improve it by mutating one residue at a time.
-    The decision to accept a mutation is probabilistic, guided by the logits and a
-    "temperature" that cools over time, causing the search to settle on a solution.
-
-    Args:
-        logits_A: Logits tensor for the first state.
-        logits_B: Logits tensor for the second state.
-        num_sequences: The number of independent sampling runs to perform.
-        iterations: The number of full passes over the sequence for refinement.
-        start_temp: The initial high temperature for sampling.
-        end_temp: The final low temperature for sampling.
-        use_wta_init: If True, start from the WTA sequence instead of a random one.
-
-    Returns:
-        A set of unique generated sequences.
     """
     print(f"--- Running Improved Gibbs Sampling ({iterations} passes) ---")
     num_residues = logits_A.shape[1]
@@ -187,8 +236,6 @@ def gibbs_sampling(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences
             
             pos = torch.randint(0, num_residues, (1,)).item()
             
-            # Slice with a range (e.g., pos:pos+1) to keep the dimension,
-            # ensuring the tensor remains 3D for get_probs().
             probs_pos = get_probs(combined_logits[:, pos:pos+1, :], temperature=current_temp)
             new_aa_index = torch.multinomial(probs_pos.squeeze(0).squeeze(0)[:20], num_samples=1)
             current_indices[pos] = new_aa_index
@@ -203,24 +250,6 @@ def gibbs_sampling(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences
 def gumbel_softmax_optimization(logits_list: List[torch.Tensor], weights: List[float], num_sequences: int, steps: int, lr: float, initial_tau: float, min_tau: float, use_wta_init: bool) -> Set[str]:
     """
     Finds an optimal sequence using Gumbel-Softmax and then samples from the result.
-
-    This is a gradient-based optimization method. It learns a new set of logits that
-    maximizes a weighted score across all input states. The Gumbel-Softmax trick
-    allows gradients to flow through the discrete choice of amino acids. The final
-    result is a probability distribution from which sequences are sampled.
-
-    Args:
-        logits_list: A list of logits tensors, one for each state.
-        weights: A list of floats representing the weight for each state's score.
-        num_sequences: The number of sequences to sample from the final distribution.
-        steps: The number of optimization steps.
-        lr: The learning rate for the Adam optimizer.
-        initial_tau: The initial high temperature for the Gumbel-Softmax.
-        min_tau: The final low temperature for the Gumbel-Softmax.
-        use_wta_init: If True, start from the WTA logits instead of random ones.
-
-    Returns:
-        A set of unique generated sequences.
     """
     print("--- Running Gumbel-Softmax Optimization ---")
     if len(logits_list) < 2 and use_wta_init:
@@ -274,30 +303,22 @@ def gumbel_softmax_optimization(logits_list: List[torch.Tensor], weights: List[f
 # --- Main Execution ---
 
 def main():
-    """
-    Generate protein sequences from multiple ProteinMPNN logits files.
-
-    This script takes as input two or more .npy files, each containing the output
-    logits from a ProteinMPNN run for a different conformational state of a protein
-    (e.g., ligand-bound vs. unbound). It then uses one of several design strategies
-    to generate new sequences that are optimized to be favorable across these states.
-
-    The output is a FASTA file containing the generated unique sequences.
-    """
     parser = argparse.ArgumentParser(
-        description="Generate protein sequences from multiple logits files using various design strategies.",
+        description="Generate multi-state protein sequences from logits files and enforce fixed residues.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # --- I/O Arguments ---
+    # --- [UPDATED] I/O and Residue Fixing Arguments ---
     parser.add_argument("--logits_files", type=str, nargs='+', required=True, help="Space-separated paths to the input .npy logits files.")
-    parser.add_argument("--out_file", type=str, required=True, help="Path to the output file. The .fasta extension will be added automatically if not present.")
-    
+    parser.add_argument("--out_file", type=str, required=True, help="Path to the output FASTA file.")
+    parser.add_argument("--pdb_for_numbering", type=str, required=True, help="Path to one of the original PDB files, used for residue numbering and native sequence.")
+    parser.add_argument("--chains_to_parse", type=str, default="", help="Comma-separated list of chains to parse from the PDB (e.g., 'A,B'). If empty, all chains are used.")
+    parser.add_argument("--fixed_residues", type=str, default="", help="Space-separated list of residues to fix (e.g., 'A12 A13 B42'). Must match the PDB.")
+
     # --- General Strategy Arguments ---
     parser.add_argument("--strategy", type=str, default="winner_take_all", choices=['weighted_average', 'winner_take_all', 'gibbs', 'gumbel', 'all'], help="The sequence design strategy to use.")
     parser.add_argument("--num_sequences", type=int, default=10, help="Number of unique sequences to generate.")
     parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling. Lower is more greedy. Applies to 'weighted_average' and 'winner_take_all'.")
     parser.add_argument("--add_scores", action='store_true', help="Calculate and add a log-likelihood score to each sequence header. Requires --weights.")
-
 
     # --- Strategy-Specific Arguments ---
     parser.add_argument("--weights", type=float, nargs='+', help="Weights for 'weighted_average' and 'gumbel' strategies. For 2 files, a single value is the weight for the first file (e.g., 0.8). For >2 files, provide a weight for each file. Must sum to 1.")
@@ -317,6 +338,19 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
+    # --- [NEW] Parse PDB for sequence and residue mapping ---
+    chains = args.chains_to_parse.split(',') if args.chains_to_parse else []
+    native_sequence, res_id_to_index = get_pdb_info(args.pdb_for_numbering, chains)
+    
+    fixed_residue_ids = set(args.fixed_residues.split())
+    fixed_indices = {res_id_to_index[res_id] for res_id in fixed_residue_ids if res_id in res_id_to_index}
+    
+    print(f"Loaded native sequence of length {len(native_sequence)} from {args.pdb_for_numbering}")
+    if fixed_indices:
+        print(f"Identified {len(fixed_indices)} fixed positions from input.")
+    else:
+        print("No fixed residues specified or found in the PDB.")
+
     # --- Load and Validate Logits ---
     all_logits = []
     try:
@@ -329,6 +363,9 @@ def main():
             all_logits.append(logits)
         
         first_shape = all_logits[0].shape
+        if len(native_sequence) != first_shape[1]:
+             sys.exit(f"Error: Sequence length mismatch. PDB has {len(native_sequence)} residues but logits have length {first_shape[1]}. Check --chains_to_parse.")
+
         for i, logit in enumerate(all_logits[1:], 1):
             if logit.shape != first_shape:
                 sys.exit(f"Error: Shape mismatch. Logits file {args.logits_files[0]} has shape {first_shape} but {args.logits_files[i]} has shape {logit.shape}.")
@@ -399,6 +436,12 @@ def main():
         run_weighted_average()
         run_gumbel()
 
+    # --- [NEW] Apply fixed residues to all generated sequences ---
+    for strategy_name, sequences in final_sequences_by_strategy.items():
+        corrected_sequences = apply_fixed_residues(sequences, native_sequence, fixed_indices)
+        final_sequences_by_strategy[strategy_name] = corrected_sequences
+
+
     # --- Write Output FASTA File ---
     output_path = args.out_file
     if not (output_path.endswith(".fasta") or output_path.endswith(".fa")):
@@ -415,22 +458,17 @@ def main():
                 
                 # --- SCORING AND SORTING LOGIC ---
                 if args.add_scores:
-                    # Calculate scores and create a list of (score, seq) tuples
                     scored_sequences = []
                     for seq in sequences_for_strategy:
                         score = calculate_sequence_score(seq, all_logits, processed_weights, device)
                         scored_sequences.append((score, seq))
                     
-                    # Sort by score in descending order (higher is better)
                     scored_sequences.sort(key=lambda x: x[0], reverse=True)
                 else:
-                    # If not scoring, just sort alphabetically
                     sequences_for_strategy.sort()
-                    # Create a list of (None, seq) tuples to fit the loop structure
                     scored_sequences = [(None, seq) for seq in sequences_for_strategy]
                 # ------------------------------------
 
-                # When running a single strategy, limit output. When 'all', write all found.
                 limit = args.num_sequences if args.strategy != 'all' else len(scored_sequences)
 
                 for i, (score, seq) in enumerate(scored_sequences):
@@ -439,7 +477,7 @@ def main():
                     total_written_count += 1
                     header = f">seq_{total_written_count}|strategy={strategy_name}"
                     if score is not None:
-                        header += f"|score={score:.4f}" # Format score to 4 decimal places
+                        header += f"|score={score:.4f}"
                     header += f"|len={len(seq)}"
                     
                     f.write(header + "\n")

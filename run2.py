@@ -242,64 +242,34 @@ def main(args) -> None:
                             j1 = restype_str_to_int[amino_acid]
                             omit_AA_per_residue[i1, j1] = 1.0
 
-        fixed_positions = torch.tensor(
-            [int(item not in fixed_residues) for item in encoded_residues],
-            device=device,
-        )
-        redesigned_positions = torch.tensor(
-            [int(item not in redesigned_residues) for item in encoded_residues],
-            device=device,
-        )
+        # PASTE THIS CODE IN ITS PLACE
+# --- [CORRECTED] MASKING LOGIC ---
+# 0 means fixed, 1 means designable
+    design_mask = torch.ones(len(encoded_residues), device=device, dtype=torch.float32)
 
-        # specify which residues are buried for checkpoint_per_residue_label_membrane_mpnn model
-        if args.transmembrane_buried:
-            buried_residues = [item for item in args.transmembrane_buried.split()]
-            buried_positions = torch.tensor(
-                [int(item in buried_residues) for item in encoded_residues],
-                device=device,
-            )
+# If --redesigned_residues is provided, it takes precedence.
+# We start with everything fixed and only make the specified residues designable.
+    redesigned_set = set(redesigned_residues_multi.get(pdb, []))
+    if redesigned_set:
+        design_mask.fill_(0.0) # Fix everything initially
+        for i, res_id in enumerate(encoded_residues):
+            if res_id in redesigned_set:
+                design_mask[i] = 1.0 # Make specified residues designable
         else:
-            buried_positions = torch.zeros_like(fixed_positions)
+    # Otherwise, use --fixed_residues.
+    # We start with everything designable and fix the specified residues.
+            fixed_set = set(fixed_residues_multi.get(pdb, []))
+            if fixed_set:
+                for i, res_id in enumerate(encoded_residues):
+                    if res_id in fixed_set:
+                        design_mask[i] = 0.0 # Fix specified residues
 
-        if args.transmembrane_interface:
-            interface_residues = [item for item in args.transmembrane_interface.split()]
-            interface_positions = torch.tensor(
-                [int(item in interface_residues) for item in encoded_residues],
-                device=device,
-            )
-        else:
-            interface_positions = torch.zeros_like(fixed_positions)
-        protein_dict["membrane_per_residue_labels"] = 2 * buried_positions * (
-            1 - interface_positions
-        ) + 1 * interface_positions * (1 - buried_positions)
+# Apply chain-specific design constraints
+        chains_to_design_list = args.chains_to_design.split(",") if args.chains_to_design else list(set(protein_dict["chain_letters"]))
+        chain_mask = torch.tensor([c in chains_to_design_list for c in protein_dict["chain_letters"]], device=device)
 
-        if args.model_type == "global_label_membrane_mpnn":
-            protein_dict["membrane_per_residue_labels"] = (
-                args.global_transmembrane_label + 0 * fixed_positions
-            )
-        if len(args.chains_to_design) != 0:
-            chains_to_design_list = args.chains_to_design.split(",")
-        else:
-            chains_to_design_list = protein_dict["chain_letters"]
-
-        chain_mask = torch.tensor(
-            np.array(
-                [
-                    item in chains_to_design_list
-                    for item in protein_dict["chain_letters"]
-                ],
-                dtype=np.int32,
-            ),
-            device=device,
-        )
-
-        # create chain_mask to notify which residues are fixed (0) and which need to be designed (1)
-        if redesigned_residues:
-            protein_dict["chain_mask"] = chain_mask * (1 - redesigned_positions)
-        elif fixed_residues:
-            protein_dict["chain_mask"] = chain_mask * fixed_positions
-        else:
-            protein_dict["chain_mask"] = chain_mask
+        protein_dict["chain_mask"] = design_mask * chain_mask
+# --- END OF CORRECTION ---
 
         if args.verbose:
             PDB_residues_to_be_redesigned = [
