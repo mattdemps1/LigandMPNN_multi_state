@@ -121,7 +121,8 @@ def sample_sequences_from_probs(probs: torch.Tensor, num_sequences: int) -> List
     
     # Normalize probabilities to ensure they sum to 1, guarding against NaNs
     probs_sum = probs_20.sum(dim=-1, keepdim=True)
-    probs_20 = probs_20 / torch.where(probs_sum > 0, probs_sum, torch.ones_like(probs_sum))
+    # Add a small epsilon to avoid division by zero
+    probs_20 = probs_20 / (probs_sum + 1e-9)
 
     # Use torch.multinomial to sample indices
     sampled_indices = torch.multinomial(probs_20, num_samples=num_sequences, replacement=True).T
@@ -187,6 +188,36 @@ def weighted_average(logits_list: List[torch.Tensor], weights: List[float], num_
     # Get probabilities and sample
     probs = get_probs(weighted_logits, temperature=temperature)
     return set(sample_sequences_from_probs(probs, num_sequences))
+
+def product_of_experts(logits_list: List[torch.Tensor], num_sequences: int, temperature: float) -> Set[str]:
+    """
+    Generates sequences from a product of probabilities (Product of Experts).
+    This method finds a consensus where an amino acid must be favorable in ALL states.
+    """
+    print(f"--- Running Product of Experts (T={temperature}) ---")
+    if not logits_list:
+        return set()
+
+    # Convert all logits to probabilities first
+    # Use a temperature of 1.0 for the initial probability calculation
+    prob_list = [get_probs(logits, temperature=1.0) for logits in logits_list]
+
+    # Multiply probabilities element-wise
+    # Start with the first probability tensor
+    combined_probs = prob_list[0]
+    for prob in prob_list[1:]:
+        combined_probs *= prob
+
+    # The result of multiplication is not a valid probability distribution,
+    # so we convert it back to logits-space to apply temperature and re-normalize
+    # Add a small epsilon to prevent log(0)
+    combined_logits = torch.log(combined_probs + 1e-9)
+
+    # Now, get the final probabilities using the desired sampling temperature
+    final_probs = get_probs(combined_logits, temperature=temperature)
+    
+    return set(sample_sequences_from_probs(final_probs, num_sequences))
+
 
 def winner_take_all(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences: int, temperature: float) -> Set[str]:
     """
@@ -307,7 +338,7 @@ def main():
         description="Generate multi-state protein sequences from logits files and enforce fixed residues.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
-    # --- [UPDATED] I/O and Residue Fixing Arguments ---
+    # --- I/O and Residue Fixing Arguments ---
     parser.add_argument("--logits_files", type=str, nargs='+', required=True, help="Space-separated paths to the input .npy logits files.")
     parser.add_argument("--out_file", type=str, required=True, help="Path to the output FASTA file.")
     parser.add_argument("--pdb_for_numbering", type=str, required=True, help="Path to one of the original PDB files, used for residue numbering and native sequence.")
@@ -315,9 +346,9 @@ def main():
     parser.add_argument("--fixed_residues", type=str, default="", help="Space-separated list of residues to fix (e.g., 'A12 A13 B42'). Must match the PDB.")
 
     # --- General Strategy Arguments ---
-    parser.add_argument("--strategy", type=str, default="winner_take_all", choices=['weighted_average', 'winner_take_all', 'gibbs', 'gumbel', 'all'], help="The sequence design strategy to use.")
+    parser.add_argument("--strategy", type=str, default="winner_take_all", choices=['weighted_average', 'product_of_experts', 'winner_take_all', 'gibbs', 'gumbel', 'all'], help="The sequence design strategy to use.")
     parser.add_argument("--num_sequences", type=int, default=10, help="Number of unique sequences to generate.")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling. Lower is more greedy. Applies to 'weighted_average' and 'winner_take_all'.")
+    parser.add_argument("--temperature", type=float, default=1.0, help="Temperature for sampling. Lower is more greedy. Applies to all strategies except gumbel/gibbs internal temps.")
     parser.add_argument("--add_scores", action='store_true', help="Calculate and add a log-likelihood score to each sequence header. Requires --weights.")
 
     # --- Strategy-Specific Arguments ---
@@ -338,7 +369,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- [NEW] Parse PDB for sequence and residue mapping ---
+    # --- Parse PDB for sequence and residue mapping ---
     chains = args.chains_to_parse.split(',') if args.chains_to_parse else []
     native_sequence, res_id_to_index = get_pdb_info(args.pdb_for_numbering, chains)
     
@@ -364,7 +395,7 @@ def main():
         
         first_shape = all_logits[0].shape
         if len(native_sequence) != first_shape[1]:
-             sys.exit(f"Error: Sequence length mismatch. PDB has {len(native_sequence)} residues but logits have length {first_shape[1]}. Check --chains_to_parse.")
+                sys.exit(f"Error: Sequence length mismatch. PDB has {len(native_sequence)} residues but logits have length {first_shape[1]}. Check --chains_to_parse.")
 
         for i, logit in enumerate(all_logits[1:], 1):
             if logit.shape != first_shape:
@@ -377,21 +408,26 @@ def main():
     processed_weights = None
     if args.strategy in ['weighted_average', 'gumbel', 'all'] or args.add_scores:
         if not args.weights:
-             sys.exit(f"Error: --weights must be provided for the '{args.strategy}' strategy and/or when using --add_scores.")
-        
-        num_logits = len(all_logits)
-        if len(args.weights) == 1 and num_logits == 2:
-            weight_A = args.weights[0]
-            if not (0.0 <= weight_A <= 1.0):
-                sys.exit(f"Error: A single weight must be between 0.0 and 1.0. Got: {weight_A}")
-            processed_weights = [weight_A, 1.0 - weight_A]
-            print(f"Using single weight input. Calculated weights: {processed_weights}")
-        elif len(args.weights) == num_logits:
-            if not math.isclose(sum(args.weights), 1.0):
-                sys.exit(f"Error: --weights must sum to 1.0. Current sum: {sum(args.weights)}")
-            processed_weights = args.weights
+            # For PoE scoring, we can create equal weights if none are provided
+            if args.add_scores and args.strategy == 'product_of_experts':
+                 processed_weights = [1.0/len(all_logits)] * len(all_logits)
+                 print(f"Creating equal weights for scoring: {processed_weights}")
+            else:
+                sys.exit(f"Error: --weights must be provided for the '{args.strategy}' strategy and/or when using --add_scores.")
         else:
-            sys.exit(f"Error: The number of weights ({len(args.weights)}) must match the number of logits files ({num_logits}), unless providing a single weight for exactly 2 files.")
+            num_logits = len(all_logits)
+            if len(args.weights) == 1 and num_logits == 2:
+                weight_A = args.weights[0]
+                if not (0.0 <= weight_A <= 1.0):
+                    sys.exit(f"Error: A single weight must be between 0.0 and 1.0. Got: {weight_A}")
+                processed_weights = [weight_A, 1.0 - weight_A]
+                print(f"Using single weight input. Calculated weights: {processed_weights}")
+            elif len(args.weights) == num_logits:
+                if not math.isclose(sum(args.weights), 1.0):
+                    sys.exit(f"Error: --weights must sum to 1.0. Current sum: {sum(args.weights)}")
+                processed_weights = args.weights
+            else:
+                sys.exit(f"Error: The number of weights ({len(args.weights)}) must match the number of logits files ({num_logits}), unless providing a single weight for exactly 2 files.")
 
     # --- Execute Strategies ---
     final_sequences_by_strategy = defaultdict(set)
@@ -399,6 +435,10 @@ def main():
     def run_weighted_average():
         seqs = weighted_average(all_logits, processed_weights, args.num_sequences, args.temperature)
         final_sequences_by_strategy['weighted_average'].update(seqs)
+    
+    def run_product_of_experts():
+        seqs = product_of_experts(all_logits, args.num_sequences, args.temperature)
+        final_sequences_by_strategy['product_of_experts'].update(seqs)
 
     def run_winner_take_all():
         if len(all_logits) != 2:
@@ -420,6 +460,8 @@ def main():
 
     if args.strategy == 'weighted_average':
         run_weighted_average()
+    elif args.strategy == 'product_of_experts':
+        run_product_of_experts()
     elif args.strategy == 'winner_take_all':
         run_winner_take_all()
     elif args.strategy == 'gibbs':
@@ -434,9 +476,10 @@ def main():
         else:
             print("Skipping 'winner_take_all' and 'gibbs' as they require exactly 2 logits files.")
         run_weighted_average()
+        run_product_of_experts()
         run_gumbel()
 
-    # --- [NEW] Apply fixed residues to all generated sequences ---
+    # --- Apply fixed residues to all generated sequences ---
     for strategy_name, sequences in final_sequences_by_strategy.items():
         corrected_sequences = apply_fixed_residues(sequences, native_sequence, fixed_indices)
         final_sequences_by_strategy[strategy_name] = corrected_sequences
@@ -449,7 +492,7 @@ def main():
         print(f"Appending .fasta extension, final output path: {output_path}")
 
     total_written_count = 0
-    strategy_order = ['winner_take_all', 'gibbs_sampling', 'weighted_average', 'gumbel_softmax']
+    strategy_order = ['winner_take_all', 'gibbs_sampling', 'weighted_average', 'product_of_experts', 'gumbel_softmax']
 
     with open(output_path, 'w') as f:
         for strategy_name in strategy_order:
@@ -457,7 +500,7 @@ def main():
                 sequences_for_strategy = list(final_sequences_by_strategy[strategy_name])
                 
                 # --- SCORING AND SORTING LOGIC ---
-                if args.add_scores:
+                if args.add_scores and processed_weights:
                     scored_sequences = []
                     for seq in sequences_for_strategy:
                         score = calculate_sequence_score(seq, all_logits, processed_weights, device)
