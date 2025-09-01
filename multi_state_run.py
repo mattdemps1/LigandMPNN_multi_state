@@ -18,54 +18,59 @@ AA_3_TO_1 = {
     'ARG': 'R', 'SER': 'S', 'THR': 'T', 'VAL': 'V', 'TRP': 'W', 'TYR': 'Y'
 }
 
-# --- [NEW] HELPER FUNCTIONS for PDB parsing and fixing residues ---
+# --- [MODIFIED] PDB PARSING LOGIC ---
 
-def get_pdb_info(pdb_path: str, chains_to_parse: List[str]) -> Tuple[str, Dict[str, int]]:
+def get_pdb_info(pdb_path: str, chains_to_parse: List[str] = None) -> Tuple[str, Dict[str, int], List[str]]:
     """
-    Parses a PDB file to get the native sequence and a map of residue IDs to indices.
-    
+    Parses a PDB file to get sequence, residue ID map, and an ordered list of residue IDs.
+
     Args:
         pdb_path: Path to the PDB file.
-        chains_to_parse: A list of chain IDs to include. If empty, all chains are used.
+        chains_to_parse: A list of chain IDs to include. If None or empty, all chains are used.
 
     Returns:
         A tuple containing:
-        - native_sequence (str): The amino acid sequence from the PDB.
+        - sequence (str): The amino acid sequence.
         - res_id_to_index (dict): A map from "A12" -> 0, "A13" -> 1, etc.
+        - ordered_res_ids (list): A list of residue IDs ("A12", "A13") in parsing order.
     """
-    native_sequence = []
+    sequence = []
     res_id_to_index = {}
-    
+    ordered_res_ids = []
     seen_residues = set()
     current_index = -1
+
+    # If chains_to_parse is an empty list, it implies all chains.
+    # We use a set for efficient checking.
+    chains_set = set(chains_to_parse) if chains_to_parse else None
 
     with open(pdb_path, 'r') as f:
         for line in f:
             if line.startswith("ATOM"):
                 chain = line[21:22].strip()
-                if not chains_to_parse or chain in chains_to_parse:
+                if chains_set is None or chain in chains_set:
                     res_seq_str = line[22:26].strip()
-                    if not res_seq_str: continue # Skip if residue number is empty
+                    if not res_seq_str: continue
                     res_seq = int(res_seq_str)
                     res_name = line[17:20].strip()
                     atom_name = line[12:16].strip()
                     icode = line[26:27].strip()
 
-                    if atom_name == "CA": # Use C-alpha atoms to define sequence
+                    if atom_name == "CA":
                         res_id_full = (chain, res_seq, icode)
                         if res_id_full not in seen_residues:
                             seen_residues.add(res_id_full)
                             current_index += 1
                             
                             if res_name in AA_3_TO_1:
-                                native_sequence.append(AA_3_TO_1[res_name])
+                                sequence.append(AA_3_TO_1[res_name])
                                 res_id_simple = f"{chain}{res_seq}{icode.strip()}"
                                 res_id_to_index[res_id_simple] = current_index
+                                ordered_res_ids.append(res_id_simple)
                             else:
                                 print(f"Warning: Skipping unrecognized residue '{res_name}' at {res_id_full}")
 
-    return "".join(native_sequence), res_id_to_index
-
+    return "".join(sequence), res_id_to_index, ordered_res_ids
 
 def apply_fixed_residues(
     sequences: Set[str], 
@@ -74,14 +79,6 @@ def apply_fixed_residues(
 ) -> Set[str]:
     """
     Enforces fixed residues on a set of generated sequences.
-
-    Args:
-        sequences: A set of sequences to process.
-        native_sequence: The original sequence from the PDB.
-        fixed_indices: A set of 0-based indices that should be fixed.
-
-    Returns:
-        A new set of sequences with the native amino acids at the fixed positions.
     """
     if not fixed_indices:
         return sequences
@@ -143,28 +140,18 @@ def calculate_sequence_score(sequence: str, logits_list: List[torch.Tensor], wei
     Calculates the weighted-average log-likelihood score for a sequence.
     A higher (less negative) score is better.
     """
-    # Convert sequence string to a tensor of indices
     try:
         indices = torch.tensor([STANDARD_ALPHABET.index(aa) for aa in sequence], device=device).long()
     except ValueError as e:
         print(f"Warning: Sequence '{sequence}' contains an invalid character. Skipping score calculation. Error: {e}")
-        return -float('inf') # Return a very bad score
+        return -float('inf')
 
     total_weighted_log_prob = 0.0
     
     for i, logits in enumerate(logits_list):
-        # Log-probabilities for the entire vocabulary at each position
-        # Use T=1.0 for an unscaled log-likelihood score
-        log_probs = F.log_softmax(logits / 1.0, dim=-1).squeeze(0) # Shape: [seq_len, vocab_size]
-        
-        # Gather the log-probabilities for the specific amino acids in the sequence
-        # indices.view(-1, 1) reshapes indices to [seq_len, 1] for gather
+        log_probs = F.log_softmax(logits / 1.0, dim=-1).squeeze(0)
         seq_log_probs = torch.gather(log_probs, 1, indices.view(-1, 1)).squeeze()
-        
-        # Sum log-probabilities to get the score for this state
         state_score = torch.sum(seq_log_probs).item()
-        
-        # Add the weighted score to the total
         total_weighted_log_prob += state_score * weights[i]
         
     return total_weighted_log_prob
@@ -173,60 +160,40 @@ def calculate_sequence_score(sequence: str, logits_list: List[torch.Tensor], wei
 # --- Sequence Design Strategies ---
 
 def weighted_average(logits_list: List[torch.Tensor], weights: List[float], num_sequences: int, temperature: float) -> Set[str]:
-    """
-    Generates sequences from a weighted average of logits.
-    """
+    """Generates sequences from a weighted average of logits."""
     print(f"--- Running Weighted Average (T={temperature}) ---")
     if len(logits_list) != len(weights):
         raise ValueError("Number of logits tensors must match the number of weights.")
     
-    # Calculate weighted average
     weighted_logits = torch.zeros_like(logits_list[0])
     for logit, weight in zip(logits_list, weights):
         weighted_logits += weight * logit
     
-    # Get probabilities and sample
     probs = get_probs(weighted_logits, temperature=temperature)
     return set(sample_sequences_from_probs(probs, num_sequences))
 
 def product_of_experts(logits_list: List[torch.Tensor], num_sequences: int, temperature: float) -> Set[str]:
-    """
-    Generates sequences from a product of probabilities (Product of Experts).
-    This method finds a consensus where an amino acid must be favorable in ALL states.
-    """
+    """Generates sequences from a product of probabilities (Product of Experts)."""
     print(f"--- Running Product of Experts (T={temperature}) ---")
     if not logits_list:
         return set()
 
-    # Convert all logits to probabilities first
-    # Use a temperature of 1.0 for the initial probability calculation
     prob_list = [get_probs(logits, temperature=1.0) for logits in logits_list]
-
-    # Multiply probabilities element-wise
-    # Start with the first probability tensor
     combined_probs = prob_list[0]
     for prob in prob_list[1:]:
         combined_probs *= prob
 
-    # The result of multiplication is not a valid probability distribution,
-    # so we convert it back to logits-space to apply temperature and re-normalize
-    # Add a small epsilon to prevent log(0)
     combined_logits = torch.log(combined_probs + 1e-9)
-
-    # Now, get the final probabilities using the desired sampling temperature
     final_probs = get_probs(combined_logits, temperature=temperature)
     
     return set(sample_sequences_from_probs(final_probs, num_sequences))
 
 
 def winner_take_all(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences: int, temperature: float) -> Set[str]:
-    """
-    For each position, chooses logits from the state with the higher max logit value.
-    """
+    """For each position, chooses logits from the state with the higher max logit value."""
     print(f"--- Running Winner-Take-All (T={temperature}) ---")
     wta_logits = get_wta_logits(logits_A, logits_B)
     
-    # Get probabilities and sample
     probs = get_probs(wta_logits, temperature=temperature)
     return set(sample_sequences_from_probs(probs, num_sequences))
 
@@ -238,19 +205,15 @@ def get_wta_logits(logits_A: torch.Tensor, logits_B: torch.Tensor) -> torch.Tens
     return (mask * logits_A) + ((1 - mask) * logits_B)
 
 def gibbs_sampling(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences: int, iterations: int, start_temp: float, end_temp: float, use_wta_init: bool) -> Set[str]:
-    """
-    Iteratively refines sequences using Gibbs sampling with temperature annealing.
-    """
+    """Iteratively refines sequences using Gibbs sampling with temperature annealing."""
     print(f"--- Running Improved Gibbs Sampling ({iterations} passes) ---")
     num_residues = logits_A.shape[1]
     device = logits_A.device
     generated_sequences = set()
 
-    # Combined logits for sampling probability calculation (hardcoded 50/50)
     combined_logits = (logits_A + logits_B) / 2.0
 
     for i in range(num_sequences):
-        # Initialize sequence
         if use_wta_init:
             print("Initializing Gibbs with 'Winner-Take-All' sequence.") if i == 0 else None
             initial_logits = get_wta_logits(logits_A, logits_B)
@@ -259,7 +222,6 @@ def gibbs_sampling(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences
             print("Initializing Gibbs with random sequence.") if i == 0 else None
             current_indices = torch.randint(0, 20, (num_residues,), device=device)
         
-        # Main sampling loop
         total_steps = iterations * num_residues
         for step in range(total_steps):
             progress = step / max(1, total_steps - 1)
@@ -279,9 +241,7 @@ def gibbs_sampling(logits_A: torch.Tensor, logits_B: torch.Tensor, num_sequences
     return generated_sequences
 
 def gumbel_softmax_optimization(logits_list: List[torch.Tensor], weights: List[float], num_sequences: int, steps: int, lr: float, initial_tau: float, min_tau: float, use_wta_init: bool) -> Set[str]:
-    """
-    Finds an optimal sequence using Gumbel-Softmax and then samples from the result.
-    """
+    """Finds an optimal sequence using Gumbel-Softmax and then samples from the result."""
     print("--- Running Gumbel-Softmax Optimization ---")
     if len(logits_list) < 2 and use_wta_init:
         raise ValueError("Winner-Take-All initialization requires at least 2 logits files.")
@@ -292,7 +252,6 @@ def gumbel_softmax_optimization(logits_list: List[torch.Tensor], weights: List[f
     device = l_A.device
     num_residues, num_vocab = l_A.shape[1], l_A.shape[2]
 
-    # 1. Initialization
     if use_wta_init:
         print("Initializing optimization with 'Winner-Take-All' logits.")
         l_B = logits_list[1]
@@ -304,7 +263,6 @@ def gumbel_softmax_optimization(logits_list: List[torch.Tensor], weights: List[f
 
     optimizer = torch.optim.Adam([sequence_logits], lr=lr)
     
-    # 2. Optimization Loop
     print("--- Starting Optimization ---")
     for i in range(steps):
         optimizer.zero_grad()
@@ -325,7 +283,6 @@ def gumbel_softmax_optimization(logits_list: List[torch.Tensor], weights: List[f
 
     print("--- Optimization Finished ---")
     
-    # 3. Sample from the final learned distribution
     final_learned_logits = sequence_logits.detach()
     probs = get_probs(final_learned_logits, temperature=1.0)
     return set(sample_sequences_from_probs(probs, num_sequences))
@@ -365,53 +322,69 @@ def main():
 
     args = parser.parse_args()
 
-    # --- Device Setup ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- Parse PDB for sequence and residue mapping ---
-    chains = args.chains_to_parse.split(',') if args.chains_to_parse else []
-    native_sequence, res_id_to_index = get_pdb_info(args.pdb_for_numbering, chains)
+    # --- [MODIFIED] PDB and Logits Loading/Slicing ---
     
-    fixed_residue_ids = set(args.fixed_residues.split())
-    fixed_indices = {res_id_to_index[res_id] for res_id in fixed_residue_ids if res_id in res_id_to_index}
+    # 1. Parse the PDB for the *entire structure* to get a complete residue map
+    #    This map must match the structure used to generate the logits.
+    _, full_res_id_to_index, _ = get_pdb_info(args.pdb_for_numbering, chains_to_parse=None)
     
-    print(f"Loaded native sequence of length {len(native_sequence)} from {args.pdb_for_numbering}")
-    if fixed_indices:
-        print(f"Identified {len(fixed_indices)} fixed positions from input.")
-    else:
-        print("No fixed residues specified or found in the PDB.")
+    # 2. Parse the PDB *again*, but this time only for the chains we want to design.
+    chains_to_design = args.chains_to_parse.split(',') if args.chains_to_parse else []
+    target_native_sequence, target_res_id_to_index, target_ordered_res_ids = get_pdb_info(args.pdb_for_numbering, chains_to_design)
+    
+    print(f"Loaded target sequence of length {len(target_native_sequence)} from PDB for chain(s): {'All' if not chains_to_design else ','.join(chains_to_design)}")
+    
+    # 3. Find the indices of our target chains within the full structure's logits.
+    try:
+        slice_indices = [full_res_id_to_index[res_id] for res_id in target_ordered_res_ids]
+    except KeyError as e:
+        sys.exit(f"Error: Residue ID {e} from parsed chain(s) not found in the full PDB structure map. Ensure PDB file is consistent.")
 
-    # --- Load and Validate Logits ---
-    all_logits = []
+    # 4. Load all logits files
+    all_logits_full = []
     try:
         for f_path in args.logits_files:
             if not os.path.exists(f_path):
                 sys.exit(f"Error: Logits file not found at {f_path}")
             logits = torch.from_numpy(np.load(f_path)).to(device).float()
-            if logits.dim() == 2: # Add batch dimension if missing
+            if logits.dim() == 2:
                 logits = logits.unsqueeze(0)
-            all_logits.append(logits)
-        
-        first_shape = all_logits[0].shape
-        if len(native_sequence) != first_shape[1]:
-                sys.exit(f"Error: Sequence length mismatch. PDB has {len(native_sequence)} residues but logits have length {first_shape[1]}. Check --chains_to_parse.")
-
-        for i, logit in enumerate(all_logits[1:], 1):
-            if logit.shape != first_shape:
-                sys.exit(f"Error: Shape mismatch. Logits file {args.logits_files[0]} has shape {first_shape} but {args.logits_files[i]} has shape {logit.shape}.")
-        print(f"Successfully loaded {len(all_logits)} logits files with shape {first_shape}.")
+            
+            # Validate against the full PDB structure length
+            if logits.shape[1] != len(full_res_id_to_index):
+                 sys.exit(f"Error: Logits file {f_path} has length {logits.shape[1]}, but the full PDB structure has {len(full_res_id_to_index)} residues.")
+            
+            all_logits_full.append(logits)
     except Exception as e:
-        sys.exit(f"Error loading or validating logits files: {e}")
+        sys.exit(f"Error loading logits files: {e}")
+        
+    # 5. Slice the full logits to get only the parts corresponding to our target chains
+    all_logits = [logit[:, slice_indices, :] for logit in all_logits_full]
+    
+    print(f"Successfully loaded and sliced {len(all_logits)} logits files to shape {all_logits[0].shape}.")
+    
+    # --- End of Modified Section ---
 
-    # --- Process weights based on strategy ---
+    # --- Setup fixed residues based on the *new*, sliced indexing ---
+    fixed_residue_ids = set(args.fixed_residues.split())
+    # The new indices are relative to the sliced sequence (0 to 76 in your case)
+    fixed_indices = {target_res_id_to_index[res_id] for res_id in fixed_residue_ids if res_id in target_res_id_to_index}
+    
+    if fixed_indices:
+        print(f"Identified {len(fixed_indices)} fixed positions from input.")
+    else:
+        print("No fixed residues specified or found for the parsed chains.")
+
+    # Process weights...
     processed_weights = None
     if args.strategy in ['weighted_average', 'gumbel', 'all'] or args.add_scores:
         if not args.weights:
-            # For PoE scoring, we can create equal weights if none are provided
             if args.add_scores and args.strategy == 'product_of_experts':
-                 processed_weights = [1.0/len(all_logits)] * len(all_logits)
-                 print(f"Creating equal weights for scoring: {processed_weights}")
+                processed_weights = [1.0/len(all_logits)] * len(all_logits)
+                print(f"Creating equal weights for scoring: {processed_weights}")
             else:
                 sys.exit(f"Error: --weights must be provided for the '{args.strategy}' strategy and/or when using --add_scores.")
         else:
@@ -481,9 +454,8 @@ def main():
 
     # --- Apply fixed residues to all generated sequences ---
     for strategy_name, sequences in final_sequences_by_strategy.items():
-        corrected_sequences = apply_fixed_residues(sequences, native_sequence, fixed_indices)
+        corrected_sequences = apply_fixed_residues(sequences, target_native_sequence, fixed_indices)
         final_sequences_by_strategy[strategy_name] = corrected_sequences
-
 
     # --- Write Output FASTA File ---
     output_path = args.out_file
@@ -499,7 +471,6 @@ def main():
             if strategy_name in final_sequences_by_strategy:
                 sequences_for_strategy = list(final_sequences_by_strategy[strategy_name])
                 
-                # --- SCORING AND SORTING LOGIC ---
                 if args.add_scores and processed_weights:
                     scored_sequences = []
                     for seq in sequences_for_strategy:
@@ -510,7 +481,6 @@ def main():
                 else:
                     sequences_for_strategy.sort()
                     scored_sequences = [(None, seq) for seq in sequences_for_strategy]
-                # ------------------------------------
 
                 limit = args.num_sequences if args.strategy != 'all' else len(scored_sequences)
 
