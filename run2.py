@@ -126,7 +126,9 @@ def main(args) -> None:
     if args.fixed_residues_multi:
         with open(args.fixed_residues_multi, "r") as fh:
             fixed_residues_multi = json.load(fh)
-            fixed_residues_multi = {key:value.split() for key,value in fixed_residues_multi.items()}
+            fixed_residues_multi = {
+                key: value.split() for key, value in fixed_residues_multi.items()
+            }
     else:
         fixed_residues = [item for item in args.fixed_residues.split()]
         fixed_residues_multi = {}
@@ -136,7 +138,9 @@ def main(args) -> None:
     if args.redesigned_residues_multi:
         with open(args.redesigned_residues_multi, "r") as fh:
             redesigned_residues_multi = json.load(fh)
-            redesigned_residues_multi = {key:value.split() for key,value in redesigned_residues_multi.items()}
+            redesigned_residues_multi = {
+                key: value.split() for key, value in redesigned_residues_multi.items()
+            }
     else:
         redesigned_residues = [item for item in args.redesigned_residues.split()]
         redesigned_residues_multi = {}
@@ -186,7 +190,6 @@ def main(args) -> None:
         parse_these_chains_only_list = args.parse_these_chains_only.split(",")
     else:
         parse_these_chains_only_list = []
-
 
     # loop over PDB paths
     for pdb in pdb_paths:
@@ -242,34 +245,42 @@ def main(args) -> None:
                             j1 = restype_str_to_int[amino_acid]
                             omit_AA_per_residue[i1, j1] = 1.0
 
-        # PASTE THIS CODE IN ITS PLACE
-# --- [CORRECTED] MASKING LOGIC ---
-# 0 means fixed, 1 means designable
-    design_mask = torch.ones(len(encoded_residues), device=device, dtype=torch.float32)
+        # --- [CORRECTED] MASKING LOGIC ---
+        # 0 means fixed, 1 means designable
+        design_mask = torch.ones(
+            len(encoded_residues), device=device, dtype=torch.float32
+        )
 
-# If --redesigned_residues is provided, it takes precedence.
-# We start with everything fixed and only make the specified residues designable.
-    redesigned_set = set(redesigned_residues_multi.get(pdb, []))
-    if redesigned_set:
-        design_mask.fill_(0.0) # Fix everything initially
-        for i, res_id in enumerate(encoded_residues):
-            if res_id in redesigned_set:
-                design_mask[i] = 1.0 # Make specified residues designable
+        # If --redesigned_residues is provided, it takes precedence.
+        # We start with everything fixed and only make the specified residues designable.
+        redesigned_set = set(redesigned_residues_multi.get(pdb, []))
+        if redesigned_set:
+            design_mask.fill_(0.0)  # Fix everything initially
+            for i, res_id in enumerate(encoded_residues):
+                if res_id in redesigned_set:
+                    design_mask[i] = 1.0  # Make specified residues designable
         else:
-    # Otherwise, use --fixed_residues.
-    # We start with everything designable and fix the specified residues.
+            # Otherwise, use --fixed_residues.
+            # We start with everything designable and fix the specified residues.
             fixed_set = set(fixed_residues_multi.get(pdb, []))
             if fixed_set:
                 for i, res_id in enumerate(encoded_residues):
                     if res_id in fixed_set:
-                        design_mask[i] = 0.0 # Fix specified residues
+                        design_mask[i] = 0.0  # Fix specified residues
 
-# Apply chain-specific design constraints
-        chains_to_design_list = args.chains_to_design.split(",") if args.chains_to_design else list(set(protein_dict["chain_letters"]))
-        chain_mask = torch.tensor([c in chains_to_design_list for c in protein_dict["chain_letters"]], device=device)
+        # Apply chain-specific design constraints
+        chains_to_design_list = (
+            args.chains_to_design.split(",")
+            if args.chains_to_design
+            else list(set(protein_dict["chain_letters"]))
+        )
+        chain_mask = torch.tensor(
+            [c in chains_to_design_list for c in protein_dict["chain_letters"]],
+            device=device,
+        )
 
         protein_dict["chain_mask"] = design_mask * chain_mask
-# --- END OF CORRECTION ---
+        # --- END OF CORRECTION ---
 
         if args.verbose:
             PDB_residues_to_be_redesigned = [
@@ -356,11 +367,13 @@ def main(args) -> None:
                     print("No ligand atoms parsed")
                 elif args.model_type == "ligand_mpnn":
                     print(
-                        f"The number of ligand atoms parsed is equal to: {number_of_atoms_parsed}"
+                        "The number of ligand atoms parsed is equal to:"
+                        f" {number_of_atoms_parsed}"
                     )
                     for i, atom_type in enumerate(atom_types):
                         print(
-                            f"Type: {element_dict_rev[atom_type]}, Coords {atom_coords[i]}, Mask {atom_mask[i]}"
+                            f"Type: {element_dict_rev[atom_type]}, Coords"
+                            f" {atom_coords[i]}, Mask {atom_mask[i]}"
                         )
             feature_dict = featurize(
                 protein_dict,
@@ -386,7 +399,7 @@ def main(args) -> None:
                 # This block runs ONLY if --save_logits is specified.
 
                 print("Running in logits-only mode...")
-                
+
                 # 1. Collect logits from each batch
                 logits_list = []
                 for _ in range(args.number_of_batches):
@@ -408,22 +421,25 @@ def main(args) -> None:
                     logits_folder_path = os.path.join(base_folder, "logits")
                     if not os.path.exists(logits_folder_path):
                         os.makedirs(logits_folder_path)
-                    
+
                     logits_filename = name + ".npy"
                     output_path = os.path.join(logits_folder_path, logits_filename)
 
                     raw_logits_numpy = averaged_logits.cpu().detach().numpy()
                     np.save(output_path, raw_logits_numpy)
-                    print(f"Saved AVERAGED raw logits ({stacked_logits.shape[0]} samples) to {output_path}")
-                
+                    print(
+                        f"Saved AVERAGED raw logits ({stacked_logits.shape[0]})"
+                        f" samples) to {output_path}"
+                    )
+
                 # 4. Exit the function early
                 print("Logits-only mode finished.")
-                return # This stops the script from generating all the other files
+                return  # This stops the script from generating all the other files
 
             else:
                 # --- NORMAL SEQUENCE DESIGN MODE ---
                 # This is the original code, which runs if --save_logits is NOT specified.
-                
+
                 sampling_probs_list = []
                 log_probs_list = []
                 decoding_order_list = []
@@ -463,7 +479,7 @@ def main(args) -> None:
                     loss_list.append(loss)
                     loss_per_residue_list.append(loss_per_residue)
                     loss_XY_list.append(loss_XY)
-                
+
                 # This part of the code is now only executed in normal mode
                 S_stack = torch.cat(S_list, 0)
                 log_probs_stack = torch.cat(log_probs_list, 0)
@@ -478,17 +494,42 @@ def main(args) -> None:
                 native_seq = "".join(
                     [restype_int_to_str[AA] for AA in feature_dict["S"][0].cpu().numpy()]
                 )
+
+                # --- [MODIFIED] FASTA SEQUENCE STRING CONSTRUCTION ---
+                # This new logic ensures that the FASTA output only contains the sequences
+                # for the chains specified with the --chains_to_design argument.
+
+                # Determine which chains to include in the FASTA file.
+                # If --chains_to_design is not used, it defaults to all chains in the PDB.
+                chains_for_fasta = (
+                    args.chains_to_design.split(",")
+                    if args.chains_to_design
+                    else list(set(protein_dict["chain_letters"]))
+                )
+                chains_for_fasta_set = set(chains_for_fasta)
+
+                # Get all unique chain letters from the PDB in a sorted order.
+                all_unique_chains = sorted(list(set(protein_dict["chain_letters"])))
+
+                # Create a mapping from each chain letter to its corresponding residue mask.
+                chain_to_mask_map = dict(zip(all_unique_chains, protein_dict["mask_c"]))
+
+                # Build the sequence string for the native sequence (used in the FASTA header).
                 seq_np = np.array(list(native_seq))
-                seq_out_str = []
-                for mask in protein_dict["mask_c"]:
-                    seq_out_str += list(seq_np[mask.cpu().numpy()])
-                    seq_out_str += [args.fasta_seq_separation]
-                seq_out_str = "".join(seq_out_str)[:-1]
+                seq_parts = []
+                for chain_letter in sorted(list(chains_for_fasta_set)):
+                    if chain_letter in chain_to_mask_map:
+                        mask = chain_to_mask_map[chain_letter]
+                        seq_parts.append("".join(seq_np[mask.cpu().numpy()]))
+                seq_out_str = args.fasta_seq_separation.join(seq_parts)
+                # --- END OF MODIFICATION ---
 
                 output_fasta = base_folder + "/seqs/" + name + args.file_ending + ".fa"
                 output_backbones = base_folder + "/backbones/"
                 output_packed = base_folder + "/packed/"
-                output_stats_path = base_folder + "stats/" + name + args.file_ending + ".pt"
+                output_stats_path = (
+                    base_folder + "stats/" + name + args.file_ending + ".pt"
+                )
 
                 out_dict = {}
                 out_dict["generated_sequences"] = S_stack.cpu()
@@ -558,7 +599,10 @@ def main(args) -> None:
                         b_factor_stack_list.append(b_factor_stack)
             with open(output_fasta, "w") as f:
                 f.write(
-                    ">{}, T={}, seed={}, num_res={}, num_ligand_res={}, use_ligand_context={}, ligand_cutoff_distance={}, batch_size={}, number_of_batches={}, model_path={}\n{}\n".format(
+                    ">{}, T={}, seed={}, num_res={}, num_ligand_res={},"
+                    " use_ligand_context={}, ligand_cutoff_distance={},"
+                    " batch_size={}, number_of_batches={},"
+                    " model_path={}\n{}\n".format(
                         name,
                         args.temperature,
                         seed,
@@ -653,16 +697,22 @@ def main(args) -> None:
                     # -----
 
                     # write fasta lines
+                    # --- [MODIFIED] FASTA SEQUENCE STRING CONSTRUCTION ---
+                    # Rebuild the sequence string for each generated sequence, using the same chain filtering logic.
                     seq_np = np.array(list(seq))
-                    seq_out_str = []
-                    for mask in protein_dict["mask_c"]:
-                        seq_out_str += list(seq_np[mask.cpu().numpy()])
-                        seq_out_str += [args.fasta_seq_separation]
-                    seq_out_str = "".join(seq_out_str)[:-1]
+                    seq_parts = []
+                    for chain_letter in sorted(list(chains_for_fasta_set)):
+                        if chain_letter in chain_to_mask_map:
+                            mask = chain_to_mask_map[chain_letter]
+                            seq_parts.append("".join(seq_np[mask.cpu().numpy()]))
+                    seq_out_str = args.fasta_seq_separation.join(seq_parts)
+                    # --- END OF MODIFICATION ---
+
                     if ix == S_stack.shape[0] - 1:
                         # final 2 lines
                         f.write(
-                            ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}".format(
+                            ">{}, id={}, T={}, seed={}, overall_confidence={},"
+                            " ligand_confidence={}, seq_rec={}\n{}".format(
                                 name,
                                 ix_suffix,
                                 args.temperature,
@@ -675,7 +725,8 @@ def main(args) -> None:
                         )
                     else:
                         f.write(
-                            ">{}, id={}, T={}, seed={}, overall_confidence={}, ligand_confidence={}, seq_rec={}\n{}\n".format(
+                            ">{}, id={}, T={}, seed={}, overall_confidence={},"
+                            " ligand_confidence={}, seq_rec={}\n{}\n".format(
                                 name,
                                 ix_suffix,
                                 args.temperature,
@@ -697,7 +748,9 @@ if __name__ == "__main__":
         "--model_type",
         type=str,
         default="protein_mpnn",
-        help="Choose your model: protein_mpnn, ligand_mpnn, per_residue_label_membrane_mpnn, global_label_membrane_mpnn, soluble_mpnn",
+        help="Choose your model: protein_mpnn, ligand_mpnn,"
+        " per_residue_label_membrane_mpnn, global_label_membrane_mpnn,"
+        " soluble_mpnn",
     )
     # protein_mpnn - original ProteinMPNN trained on the whole PDB exluding non-protein atoms
     # ligand_mpnn - atomic context aware model trained with small molecules, nucleotides, metals etc on the whole PDB
@@ -750,7 +803,8 @@ if __name__ == "__main__":
         "--pdb_path_multi",
         type=str,
         default="",
-        help="Path to json listing PDB paths. {'/path/to/pdb': ''} - only keys will be used.",
+        help="Path to json listing PDB paths. {'/path/to/pdb': ''} - only"
+        " keys will be used.",
     )
 
     argparser.add_argument(
@@ -763,39 +817,45 @@ if __name__ == "__main__":
         "--fixed_residues_multi",
         type=str,
         default="",
-        help="Path to json mapping of fixed residues for each pdb i.e., {'/path/to/pdb': 'A12 A13 A14 B2 B25'}",
+        help="Path to json mapping of fixed residues for each pdb i.e.,"
+        " {'/path/to/pdb': 'A12 A13 A14 B2 B25'}",
     )
 
     argparser.add_argument(
         "--redesigned_residues",
         type=str,
         default="",
-        help="Provide to be redesigned residues, everything else will be fixed, A12 A13 A14 B2 B25",
+        help="Provide to be redesigned residues, everything else will be fixed,"
+        " A12 A13 A14 B2 B25",
     )
     argparser.add_argument(
         "--redesigned_residues_multi",
         type=str,
         default="",
-        help="Path to json mapping of redesigned residues for each pdb i.e., {'/path/to/pdb': 'A12 A13 A14 B2 B25'}",
+        help="Path to json mapping of redesigned residues for each pdb i.e.,"
+        " {'/path/to/pdb': 'A12 A13 A14 B2 B25'}",
     )
 
     argparser.add_argument(
         "--bias_AA",
         type=str,
         default="",
-        help="Bias generation of amino acids, e.g. 'A:-1.024,P:2.34,C:-12.34'",
+        help="Bias generation of amino acids, e.g."
+        " 'A:-1.024,P:2.34,C:-12.34'",
     )
     argparser.add_argument(
         "--bias_AA_per_residue",
         type=str,
         default="",
-        help="Path to json mapping of bias {'A12': {'G': -0.3, 'C': -2.0, 'H': 0.8}, 'A13': {'G': -1.3}}",
+        help="Path to json mapping of bias {'A12': {'G': -0.3, 'C': -2.0,"
+        " 'H': 0.8}, 'A13': {'G': -1.3}}",
     )
     argparser.add_argument(
         "--bias_AA_per_residue_multi",
         type=str,
         default="",
-        help="Path to json mapping of bias {'pdb_path': {'A12': {'G': -0.3, 'C': -2.0, 'H': 0.8}, 'A13': {'G': -1.3}}}",
+        help="Path to json mapping of bias {'pdb_path': {'A12': {'G': -0.3,"
+        " 'C': -2.0, 'H': 0.8}, 'A13': {'G': -1.3}}}",
     )
 
     argparser.add_argument(
@@ -814,26 +874,31 @@ if __name__ == "__main__":
         "--omit_AA_per_residue_multi",
         type=str,
         default="",
-        help="Path to json mapping of bias {'pdb_path': {'A12': 'QSPC', 'A13': 'AGE'}}",
+        help="Path to json mapping of bias {'pdb_path': {'A12': 'QSPC', 'A13':"
+        " 'AGE'}}",
     )
 
     argparser.add_argument(
         "--symmetry_residues",
         type=str,
         default="",
-        help="Add list of lists for which residues need to be symmetric, e.g. 'A12,A13,A14|C2,C3|A5,B6'",
+        help="Add list of lists for which residues need to be symmetric, e.g."
+        " 'A12,A13,A14|C2,C3|A5,B6'",
     )
     argparser.add_argument(
         "--symmetry_weights",
         type=str,
         default="",
-        help="Add weights that match symmetry_residues, e.g. '1.01,1.0,1.0|-1.0,2.0|2.0,2.3'",
+        help="Add weights that match symmetry_residues, e.g."
+        " '1.01,1.0,1.0|-1.0,2.0|2.0,2.3'",
     )
     argparser.add_argument(
         "--homo_oligomer",
         type=int,
         default=0,
-        help="Setting this to 1 will automatically set --symmetry_residues and --symmetry_weights to do homooligomer design with equal weighting.",
+        help="Setting this to 1 will automatically set --symmetry_residues and"
+        " --symmetry_weights to do homooligomer design with equal"
+        " weighting.",
     )
 
     argparser.add_argument(
@@ -888,19 +953,22 @@ if __name__ == "__main__":
         "--ligand_mpnn_cutoff_for_score",
         type=float,
         default=8.0,
-        help="Cutoff in angstroms between protein and context atoms to select residues for reporting score.",
+        help="Cutoff in angstroms between protein and context atoms to select"
+        " residues for reporting score.",
     )
     argparser.add_argument(
         "--ligand_mpnn_use_side_chain_context",
         type=int,
         default=0,
-        help="Flag to use side chain atoms as ligand context for the fixed residues",
+        help="Flag to use side chain atoms as ligand context for the fixed"
+        " residues",
     )
     argparser.add_argument(
         "--chains_to_design",
         type=str,
         default="",
-        help="Specify which chains to redesign, all others will be kept fixed, 'A,B,C,F'",
+        help="Specify which chains to redesign, all others will be kept fixed,"
+        " 'A,B,C,F'",
     )
 
     argparser.add_argument(
@@ -914,27 +982,33 @@ if __name__ == "__main__":
         "--transmembrane_buried",
         type=str,
         default="",
-        help="Provide buried residues when using checkpoint_per_residue_label_membrane_mpnn model, A12 A13 A14 B2 B25",
+        help="Provide buried residues when using"
+        " checkpoint_per_residue_label_membrane_mpnn model, A12 A13 A14"
+        " B2 B25",
     )
     argparser.add_argument(
         "--transmembrane_interface",
         type=str,
         default="",
-        help="Provide interface residues when using checkpoint_per_residue_label_membrane_mpnn model, A12 A13 A14 B2 B25",
+        help="Provide interface residues when using"
+        " checkpoint_per_residue_label_membrane_mpnn model, A12 A13 A14"
+        " B2 B25",
     )
 
     argparser.add_argument(
         "--global_transmembrane_label",
         type=int,
         default=0,
-        help="Provide global label for global_label_membrane_mpnn model. 1 - transmembrane, 0 - soluble",
+        help="Provide global label for global_label_membrane_mpnn model. 1 -"
+        " transmembrane, 0 - soluble",
     )
 
     argparser.add_argument(
         "--parse_atoms_with_zero_occupancy",
         type=int,
         default=0,
-        help="To parse atoms with zero occupancy in the PDB input files. 0 - do not parse, 1 - parse atoms with zero occupancy",
+        help="To parse atoms with zero occupancy in the PDB input files. 0 -"
+        " do not parse, 1 - parse atoms with zero occupancy",
     )
 
     argparser.add_argument(
@@ -955,35 +1029,40 @@ if __name__ == "__main__":
         "--number_of_packs_per_design",
         type=int,
         default=4,
-        help="Number of independent side chain packing samples to return per design",
+        help="Number of independent side chain packing samples to return per"
+        " design",
     )
 
     argparser.add_argument(
         "--sc_num_denoising_steps",
         type=int,
         default=3,
-        help="Number of denoising/recycling steps to make for side chain packing",
+        help="Number of denoising/recycling steps to make for side chain"
+        " packing",
     )
 
     argparser.add_argument(
         "--sc_num_samples",
         type=int,
         default=16,
-        help="Number of samples to draw from a mixture distribution and then take a sample with the highest likelihood.",
+        help="Number of samples to draw from a mixture distribution and then"
+        " take a sample with the highest likelihood.",
     )
 
     argparser.add_argument(
         "--repack_everything",
         type=int,
         default=0,
-        help="1 - repacks side chains of all residues including the fixed ones; 0 - keeps the side chains fixed for fixed residues",
+        help="1 - repacks side chains of all residues including the fixed"
+        " ones; 0 - keeps the side chains fixed for fixed residues",
     )
 
     argparser.add_argument(
         "--force_hetatm",
         type=int,
         default=0,
-        help="To force ligand atoms to be written as HETATM to PDB file after packing.",
+        help="To force ligand atoms to be written as HETATM to PDB file after"
+        " packing.",
     )
 
     argparser.add_argument(
@@ -1003,7 +1082,8 @@ if __name__ == "__main__":
     argparser.add_argument(
         "--save_logits",
         action="store_true",
-        help="If specified, save raw logits to 'logits.npy' inside the out_folder.",
+        help="If specified, save raw logits to 'logits.npy' inside the"
+        " out_folder.",
     )
 
     args = argparser.parse_args()
